@@ -48,5 +48,20 @@ export const SMART_RECRUITERS_COMPANIES = [
   { id: "DeliveryHero", label: "Delivery Hero" },
 ] as const;
 
+export const EXTERNAL_ROLE_SEARCH_TERMS = [
+  "software engineer",
+  "frontend engineer",
+  "backend engineer",
+  "full stack engineer",
+  "mobile engineer",
+  "data engineer",
+  "machine learning engineer",
+  "devops engineer",
+  "site reliability engineer",
+  "security engineer",
+] as const;
+
 export const ARBEITNOW_PAGE_COUNT = 12;
 export const THE_MUSE_PAGE_COUNT = 10;
+export const LINKEDIN_PAGE_STARTS = [0, 25, 50, 75, 100] as const;
+export const UNSTOP_PAGE_COUNT = 6;

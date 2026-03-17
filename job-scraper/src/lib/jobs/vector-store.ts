@@ -1,26 +1,36 @@
-import fs from "node:fs/promises";
-import path from "node:path";
+import {
+  createHash,
+} from "node:crypto";
 
-import { LocalIndex, type IndexItem, type MetadataFilter } from "vectra";
+import {
+  CloudClient,
+  type Collection,
+  type Metadata,
+} from "chromadb";
 
-import { ALL_ROLE_VALUE, SOFTWARE_ROLES, type RoleFilterValue, type SoftwareRoleId } from "@/lib/jobs/roles";
+import {
+  ALL_ROLE_VALUE,
+  SOFTWARE_ROLES,
+  type RoleFilterValue,
+  type SoftwareRoleId,
+} from "@/lib/jobs/roles";
 import type { StoredJobRecord } from "@/lib/jobs/types";
 
 const VECTOR_DIMENSIONS = 192;
-const INDEX_PATH = path.join(process.cwd(), ".vectra", "jobs-store-v1");
+const COLLECTION_NAME = process.env.CHROMA_COLLECTION ?? "job-scraper-jobs-v2";
+const UPSERT_BATCH_SIZE = 10;
+const LIST_BATCH_SIZE = 200;
 
-type VectorJobMetadata = {
+type ChromaJobMetadata = {
   canonicalKey: string;
   companyName: string;
   lastSeenAt: number;
   location: string;
-  payload: string;
   primaryRole: string;
   remote: boolean;
-  searchText: string;
   title: string;
   updatedAt: number;
-} & Record<string, string | number | boolean>;
+} & Metadata;
 
 type RelatedJobMatch = {
   job: StoredJobRecord;
@@ -31,7 +41,7 @@ const ROLE_METADATA_KEYS = Object.fromEntries(
   SOFTWARE_ROLES.map((role) => [role.id, `role__${role.id.replace(/-/g, "_")}`]),
 ) as Record<SoftwareRoleId, string>;
 
-let cachedIndex: LocalIndex<VectorJobMetadata> | null = null;
+let cachedCollectionPromise: Promise<Collection> | null = null;
 
 function normalizeValue(value: string) {
   return value.trim().toLowerCase();
@@ -104,7 +114,7 @@ function createSearchText(job: StoredJobRecord) {
     .join(" ");
 }
 
-function toVectorMetadata(job: StoredJobRecord): VectorJobMetadata {
+function toChromaMetadata(job: StoredJobRecord): ChromaJobMetadata {
   return {
     canonicalKey: job.canonicalKey,
     title: job.title,
@@ -112,66 +122,98 @@ function toVectorMetadata(job: StoredJobRecord): VectorJobMetadata {
     location: job.location,
     primaryRole: job.primaryRole,
     remote: job.remote,
-    searchText: createSearchText(job),
     lastSeenAt: new Date(job.lastSeenAt).getTime(),
     updatedAt: new Date(job.updatedAt).getTime(),
-    payload: JSON.stringify(job),
     ...buildRoleMetadata(job.matchedRoles),
   };
 }
 
-function fromVectorMetadata(metadata: VectorJobMetadata) {
-  if (!metadata.payload) {
-    throw new Error("Vector index item is missing its payload.");
+function parseStoredJob(document: string | null | undefined) {
+  if (!document) {
+    throw new Error("Chroma record is missing its payload document.");
   }
 
-  return JSON.parse(metadata.payload) as StoredJobRecord;
+  return JSON.parse(document) as StoredJobRecord;
 }
 
-async function hydrateItemMetadata(item: IndexItem<VectorJobMetadata>) {
-  if (!item.metadataFile || item.metadata.payload) {
-    return item.metadata;
-  }
-
-  const metadataPath = path.join(INDEX_PATH, item.metadataFile);
-  const payload = JSON.parse(await fs.readFile(metadataPath, "utf8")) as VectorJobMetadata;
-  return payload;
+function clampText(value: string, maxLength: number) {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
 }
 
-async function ensureIndex() {
-  if (!cachedIndex) {
-    cachedIndex = new LocalIndex<VectorJobMetadata>(INDEX_PATH);
-  }
-
-  if (!(await cachedIndex.isIndexCreated())) {
-    await cachedIndex.createIndex({
-      version: 1,
-      metadata_config: {
-        indexed: [
-          "canonicalKey",
-          "primaryRole",
-          "remote",
-          "updatedAt",
-          "lastSeenAt",
-          ...Object.values(ROLE_METADATA_KEYS),
-        ],
-      },
-    });
-  }
-
-  return cachedIndex;
-}
-
-function buildRoleFilter(role: RoleFilterValue): MetadataFilter | undefined {
-  if (role === ALL_ROLE_VALUE) {
-    return undefined;
-  }
-
+function buildCompactStoredJob(
+  job: StoredJobRecord,
+  limits: {
+    description: number;
+    shortDescription: number;
+    searchText: number;
+  },
+): StoredJobRecord {
   return {
-    [ROLE_METADATA_KEYS[role]]: {
-      $eq: true,
-    },
+    ...job,
+    description: clampText(job.description, limits.description),
+    shortDescription: clampText(job.shortDescription, limits.shortDescription),
+    searchText: clampText(job.searchText, limits.searchText),
+    sourceSnapshots: [],
   };
+}
+
+function serializeStoredJob(job: StoredJobRecord) {
+  const candidates = [
+    buildCompactStoredJob(job, {
+      description: 1800,
+      shortDescription: 420,
+      searchText: 2400,
+    }),
+    buildCompactStoredJob(job, {
+      description: 900,
+      shortDescription: 320,
+      searchText: 1400,
+    }),
+    buildCompactStoredJob(
+      {
+        ...job,
+        description: job.shortDescription,
+        searchText: [
+          job.title,
+          job.companyName,
+          job.location,
+          job.tags.join(" "),
+          job.shortDescription,
+        ]
+          .filter(Boolean)
+          .join(" "),
+      },
+      {
+        description: 420,
+        shortDescription: 260,
+        searchText: 900,
+      },
+    ),
+  ];
+
+  for (const candidate of candidates) {
+    const serialized = JSON.stringify(candidate);
+
+    if (serialized.length <= 15000) {
+      return serialized;
+    }
+  }
+
+  return JSON.stringify(candidates[candidates.length - 1]);
+}
+
+function chunkItems<T>(items: T[], chunkSize: number) {
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+
+  return chunks;
+}
+
+function createRecordId(canonicalKey: string) {
+  return createHash("sha256").update(canonicalKey).digest("hex");
 }
 
 function locationMatches(job: StoredJobRecord, location: string) {
@@ -189,32 +231,121 @@ function locationMatches(job: StoredJobRecord, location: string) {
   return jobLocation.includes(normalizedLocation);
 }
 
+function resolveChromaConfig() {
+  const apiKey = process.env.CHROMA_API_KEY;
+  const tenant = process.env.CHROMA_TENANT;
+  const database = process.env.CHROMA_DATABASE;
+  const missing = [
+    !apiKey ? "CHROMA_API_KEY" : null,
+    !tenant ? "CHROMA_TENANT" : null,
+    !database ? "CHROMA_DATABASE" : null,
+  ].filter(Boolean);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing Chroma configuration: ${missing.join(", ")}. Set them in .env.local or your deployment environment.`,
+    );
+  }
+
+  return {
+    apiKey,
+    tenant,
+    database,
+    host: process.env.CHROMA_HOST,
+    port: process.env.CHROMA_PORT ? Number(process.env.CHROMA_PORT) : undefined,
+  };
+}
+
+async function getCollection() {
+  if (!cachedCollectionPromise) {
+    cachedCollectionPromise = (async () => {
+      const config = resolveChromaConfig();
+      const client = new CloudClient({
+        apiKey: config.apiKey,
+        tenant: config.tenant,
+        database: config.database,
+        host: config.host,
+        port: config.port,
+      });
+
+      return client.getOrCreateCollection({
+        name: COLLECTION_NAME,
+        embeddingFunction: null,
+        metadata: {
+          app: "job-scraper",
+          version: 2,
+        },
+      });
+    })().catch((error) => {
+      cachedCollectionPromise = null;
+      throw error;
+    });
+  }
+
+  return cachedCollectionPromise;
+}
+
 export async function listStoredJobs() {
-  const index = await ensureIndex();
-  const items = await index.listItems<VectorJobMetadata>();
+  const collection = await getCollection();
+  const total = await collection.count();
 
-  const hydratedItems = await Promise.all(
-    items.map(async (item) => hydrateItemMetadata(item)),
-  );
+  if (total === 0) {
+    return [] as StoredJobRecord[];
+  }
 
-  return hydratedItems.flatMap((metadata) => {
-    try {
-      return [fromVectorMetadata(metadata)];
-    } catch {
-      return [];
+  const jobs: StoredJobRecord[] = [];
+
+  for (let offset = 0; offset < total; offset += LIST_BATCH_SIZE) {
+    const batch = await collection.get<ChromaJobMetadata>({
+      limit: LIST_BATCH_SIZE,
+      offset,
+      include: ["documents", "metadatas"],
+    });
+
+    for (const [index, metadata] of batch.metadatas.entries()) {
+      try {
+        const document = batch.documents[index] ?? null;
+        const job = parseStoredJob(document);
+
+        if (metadata) {
+          jobs.push({
+            ...job,
+            canonicalKey: metadata.canonicalKey,
+          });
+          continue;
+        }
+
+        jobs.push(job);
+      } catch {
+        continue;
+      }
     }
-  });
+  }
+
+  return jobs;
 }
 
 export async function getStoredJob(canonicalKey: string) {
-  const index = await ensureIndex();
-  const item = await index.getItem<VectorJobMetadata>(canonicalKey);
+  const collection = await getCollection();
+  const result = await collection.get<ChromaJobMetadata>({
+    where: {
+      canonicalKey: {
+        $eq: canonicalKey,
+      },
+    },
+    limit: 1,
+    include: ["documents", "metadatas"],
+  });
 
-  if (!item) {
+  const document = result.documents[0] ?? null;
+  const metadata = result.metadatas[0] ?? null;
+
+  if (!document) {
     return null;
   }
 
-  return fromVectorMetadata(await hydrateItemMetadata(item));
+  const job = parseStoredJob(document);
+  return metadata ? { ...job, canonicalKey: metadata.canonicalKey } : job;
 }
 
 export async function upsertStoredJobs(records: StoredJobRecord[]) {
@@ -222,24 +353,15 @@ export async function upsertStoredJobs(records: StoredJobRecord[]) {
     return;
   }
 
-  const index = await ensureIndex();
-  await index.beginUpdate();
+  const collection = await getCollection();
 
-  try {
-    for (const job of records) {
-      const metadata = toVectorMetadata(job);
-
-      await index.upsertItem({
-        id: job.canonicalKey,
-        vector: embedText(metadata.searchText),
-        metadata,
-      });
-    }
-
-    await index.endUpdate();
-  } catch (error) {
-    index.cancelUpdate();
-    throw error;
+  for (const batch of chunkItems(records, UPSERT_BATCH_SIZE)) {
+    await collection.upsert({
+      ids: batch.map((job) => createRecordId(job.canonicalKey)),
+      embeddings: batch.map((job) => embedText(createSearchText(job))),
+      documents: batch.map((job) => serializeStoredJob(job)),
+      metadatas: batch.map((job) => toChromaMetadata(job)),
+    });
   }
 }
 
@@ -249,9 +371,13 @@ export async function queryRelatedJobs(options: {
   location?: string;
   limit?: number;
 }) {
-  const searchQuery = [options.query, options.role && options.role !== ALL_ROLE_VALUE
-    ? SOFTWARE_ROLES.find((role) => role.id === options.role)?.label ?? ""
-    : "", options.location ?? ""]
+  const searchQuery = [
+    options.query,
+    options.role && options.role !== ALL_ROLE_VALUE
+      ? SOFTWARE_ROLES.find((role) => role.id === options.role)?.label ?? ""
+      : "",
+    options.location ?? "",
+  ]
     .filter(Boolean)
     .join(" ");
 
@@ -259,23 +385,43 @@ export async function queryRelatedJobs(options: {
     return [] as RelatedJobMatch[];
   }
 
-  const index = await ensureIndex();
-  const results = await index.queryItems<VectorJobMetadata>(
-    embedText(searchQuery),
-    searchQuery,
-    Math.max(options.limit ?? 12, 12),
-    buildRoleFilter(options.role ?? ALL_ROLE_VALUE),
-  );
+  const collection = await getCollection();
+  const queryResult = await collection.query<ChromaJobMetadata>({
+    queryEmbeddings: [embedText(searchQuery)],
+    nResults: Math.max((options.limit ?? 12) * 4, 24),
+    include: ["documents", "metadatas", "distances"],
+  });
 
-  return results
-    .map((result) => ({
-      job: fromVectorMetadata(result.item.metadata),
-      score: result.score,
-    }))
-    .filter((entry) => locationMatches(entry.job, options.location ?? ""));
-}
+  const rows = queryResult.rows()[0] ?? [];
 
-export async function getVectorIndexStats() {
-  const index = await ensureIndex();
-  return index.getIndexStats();
+  return rows
+    .flatMap((row) => {
+      try {
+        const job = parseStoredJob(row.document ?? null);
+
+        if (
+          options.role &&
+          options.role !== ALL_ROLE_VALUE &&
+          !job.matchedRoles.includes(options.role)
+        ) {
+          return [];
+        }
+
+        if (!locationMatches(job, options.location ?? "")) {
+          return [];
+        }
+
+        const distance = row.distance ?? 2;
+
+        return [
+          {
+            job,
+            score: Math.max(0, 1 - distance / 2),
+          },
+        ];
+      } catch {
+        return [];
+      }
+    })
+    .slice(0, options.limit ?? 12);
 }

@@ -1,6 +1,9 @@
-import "dotenv/config";
+import { config as loadEnv } from "dotenv";
 
 import { runScrapeCycle } from "../lib/jobs/service";
+
+loadEnv({ path: ".env.local" });
+loadEnv();
 
 const intervalMs = Number(process.env.SCRAPE_INTERVAL_MS ?? 10000);
 let isRunning = false;

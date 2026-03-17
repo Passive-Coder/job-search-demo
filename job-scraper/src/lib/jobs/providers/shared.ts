@@ -31,6 +31,29 @@ export async function fetchJson<T>(
   return (await response.json()) as T;
 }
 
+export async function fetchText(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = 7000,
+): Promise<string> {
+  const response = await fetch(url, {
+    ...init,
+    headers: {
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "User-Agent": "job-scraper/1.0 (+https://localhost)",
+      ...(init?.headers ?? {}),
+    },
+    cache: "no-store",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+
+  return await response.text();
+}
+
 export function asDate(value: string | null | undefined): Date | null {
   if (!value) {
     return null;

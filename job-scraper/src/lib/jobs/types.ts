@@ -6,7 +6,9 @@ export type ProviderId =
   | "arbeitnow"
   | "remoteok"
   | "themuse"
-  | "remotive";
+  | "remotive"
+  | "linkedin"
+  | "unstop";
 
 export type ProviderKind = "ats" | "aggregator";
 

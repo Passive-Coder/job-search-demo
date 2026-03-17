@@ -43,8 +43,8 @@ export async function GET(request: Request) {
     });
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : "Failed to load jobs.";
-    const message = /vector|index/i.test(rawMessage)
-      ? "The local vector index is warming up. Retry in a few seconds."
+    const message = /vector|index|chroma/i.test(rawMessage)
+      ? "The Chroma job index is unavailable. Check the Chroma env vars and retry."
       : rawMessage;
 
     return NextResponse.json(

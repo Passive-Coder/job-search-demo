@@ -12,15 +12,13 @@ import {
   getDomain,
   isAggregatorUrl,
 } from "@/lib/jobs/normalize";
-import { scrapeArbeitnowJobs } from "@/lib/jobs/providers/arbeitnow";
-import { scrapeGreenhouseJobs } from "@/lib/jobs/providers/greenhouse";
-import { scrapeRemoteOkJobs } from "@/lib/jobs/providers/remoteok";
-import { scrapeRemotiveJobs } from "@/lib/jobs/providers/remotive";
-import { scrapeSmartRecruitersJobs } from "@/lib/jobs/providers/smartrecruiters";
-import { scrapeTheMuseJobs } from "@/lib/jobs/providers/themuse";
+import { preferOfficialCompanyLink } from "@/lib/jobs/company-link-resolver";
+import { scrapeLinkedInJobs } from "@/lib/jobs/providers/linkedin";
+import { scrapeUnstopJobs } from "@/lib/jobs/providers/unstop";
 import type {
   JobCard,
   JobSeed,
+  ProviderId,
   ScrapeSummary,
   SourceSnapshot,
   StoredJobRecord,
@@ -33,6 +31,8 @@ import {
 
 const DEFAULT_TARGET_RECORDS = Number(process.env.SCRAPE_TARGET_RECORDS ?? 1000);
 const SCRAPE_INTERVAL_MS = Number(process.env.SCRAPE_INTERVAL_MS ?? 10000);
+const SCRAPE_WRITE_BATCH_SIZE = 10;
+const ACTIVE_PROVIDER_IDS = new Set<ProviderId>(["linkedin", "unstop"]);
 
 let activeScrapeCycle: Promise<ScrapeSummary> | null = null;
 let lastScrapeStartedAt = 0;
@@ -55,6 +55,10 @@ type JobSearchFilters = {
 
 function normalizeValue(value?: string) {
   return value?.trim().toLowerCase() ?? "";
+}
+
+function isActiveProvider(provider: ProviderId) {
+  return ACTIVE_PROVIDER_IDS.has(provider);
 }
 
 function tokenizeValue(value: string) {
@@ -102,6 +106,16 @@ function dedupeSeeds(seeds: JobSeed[]): JobSeed[] {
   return [...unique.values()]
     .sort((left, right) => compareSeeds(left, right))
     .slice(0, Math.max(DEFAULT_TARGET_RECORDS * 2, 1500));
+}
+
+function chunkItems<T>(items: T[], chunkSize: number) {
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+
+  return chunks;
 }
 
 function mergeTags(current: string[] = [], incoming: string[] = []) {
@@ -373,12 +387,8 @@ async function runScrapeCycleOnce(): Promise<ScrapeSummary> {
   const startedAt = Date.now();
 
   const providerResults = await Promise.allSettled([
-    scrapeGreenhouseJobs(),
-    scrapeSmartRecruitersJobs(),
-    scrapeArbeitnowJobs(),
-    scrapeRemoteOkJobs(),
-    scrapeTheMuseJobs(),
-    scrapeRemotiveJobs(),
+    scrapeLinkedInJobs(),
+    scrapeUnstopJobs(),
   ]);
 
   const allSeeds: JobSeed[] = [];
@@ -396,26 +406,35 @@ async function runScrapeCycleOnce(): Promise<ScrapeSummary> {
     errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
   }
 
-  const dedupedSeeds = dedupeSeeds(allSeeds);
+  const dedupedSeeds = await Promise.all(
+    dedupeSeeds(allSeeds).map((seed) => preferOfficialCompanyLink(seed)),
+  );
   const existingJobs = await listStoredJobs();
   const existingByKey = new Map(existingJobs.map((job) => [job.canonicalKey, job]));
-  const nowIso = new Date().toISOString();
+  let upserted = 0;
 
-  const records = dedupedSeeds.map((seed) =>
-    buildStoredJobRecord(
-      seed,
-      existingByKey.get(createCanonicalKey(seed)) ?? null,
-      nowIso,
-    ),
-  );
+  for (const chunk of chunkItems(dedupedSeeds, SCRAPE_WRITE_BATCH_SIZE)) {
+    const nowIso = new Date().toISOString();
+    const records = chunk.map((seed) => {
+      const record = buildStoredJobRecord(
+        seed,
+        existingByKey.get(createCanonicalKey(seed)) ?? null,
+        nowIso,
+      );
 
-  await upsertStoredJobs(records);
+      existingByKey.set(record.canonicalKey, record);
+      return record;
+    });
+
+    await upsertStoredJobs(records);
+    upserted += records.length;
+  }
 
   return {
     durationMs: Date.now() - startedAt,
     fetched: allSeeds.length,
     deduped: dedupedSeeds.length,
-    upserted: records.length,
+    upserted,
     sources,
     errors: errors.slice(0, 20),
   };
@@ -464,7 +483,7 @@ export async function getJobs(options?: JobSearchOptions) {
     Boolean(filters.location) ||
     filters.role !== ALL_ROLE_VALUE;
 
-  const allJobs = await listStoredJobs();
+  const allJobs = (await listStoredJobs()).filter((job) => isActiveProvider(job.provider));
   const relatedMatches = filters.query
     ? await queryRelatedJobs({
         query: filters.query,
@@ -472,6 +491,7 @@ export async function getJobs(options?: JobSearchOptions) {
         location: filters.location,
         limit: Math.max(limit * 4, 30),
       })
+        .then((matches) => matches.filter((entry) => isActiveProvider(entry.job.provider)))
     : [];
   const semanticScores = new Map(
     relatedMatches.map((entry) => [entry.job.canonicalKey, entry.score]),
@@ -532,24 +552,14 @@ export async function searchJobs(options?: JobSearchOptions) {
   let scrapeSummary: ScrapeSummary | null = null;
 
   const currentJobs = await getJobs(options);
-  const relatedMatches =
-    options?.query?.trim()
-      ? await queryRelatedJobs({
-          query: options.query,
-          role: options.role ?? ALL_ROLE_VALUE,
-          location: options.location ?? "",
-          limit: 10,
-        })
-      : [];
-  const hasRelatedRecords =
-    currentJobs.total > 0 ||
-    relatedMatches.some((entry) => entry.score >= 0.14);
-
-  if (options?.scrapeBeforeRead && !hasRelatedRecords) {
+  if (options?.scrapeBeforeRead) {
     scrapeSummary = await runScrapeCycle();
   }
 
-  const finalJobs = scrapeSummary ? await getJobs(options) : currentJobs;
+  const finalJobs =
+    scrapeSummary || currentJobs.total !== 0
+      ? await getJobs(options)
+      : currentJobs;
 
   return {
     ...finalJobs,

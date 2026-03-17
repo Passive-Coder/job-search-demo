@@ -4,6 +4,7 @@
 
 import gsap from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
+import * as THREE from "three";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import {
@@ -24,8 +25,16 @@ type JobsResponse = {
   };
 };
 
+type ThreeSceneState = {
+  camera: THREE.PerspectiveCamera;
+  renderer: THREE.WebGLRenderer;
+  suitcaseGroup: THREE.Group;
+  lidPivot: THREE.Group;
+  dispose: () => void;
+};
+
 const RESULT_LIMIT = 100;
-const CASE_RATIO = 1.58;
+const CASE_RATIO = 1.2;
 
 function formatRelative(value: string | null) {
   if (!value) {
@@ -63,8 +72,8 @@ function getInitials(value: string) {
 }
 
 function humanizeError(message: string) {
-  if (/vector|index/i.test(message)) {
-    return "The local vector index is warming up. Retry the search in a moment.";
+  if (/vector|index|chroma/i.test(message)) {
+    return "The Chroma job index is unavailable. Check the Chroma env vars and retry.";
   }
 
   if (/timed out|timeout/i.test(message)) {
@@ -72,6 +81,360 @@ function humanizeError(message: string) {
   }
 
   return message;
+}
+
+function createRoundedRectShape(width: number, height: number, radius: number) {
+  const x = -width / 2;
+  const y = -height / 2;
+  const shape = new THREE.Shape();
+
+  shape.moveTo(x + radius, y);
+  shape.lineTo(x + width - radius, y);
+  shape.quadraticCurveTo(x + width, y, x + width, y + radius);
+  shape.lineTo(x + width, y + height - radius);
+  shape.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+  shape.lineTo(x + radius, y + height);
+  shape.quadraticCurveTo(x, y + height, x, y + height - radius);
+  shape.lineTo(x, y + radius);
+  shape.quadraticCurveTo(x, y, x + radius, y);
+
+  return shape;
+}
+
+function createRoundedCaseGeometry(
+  width: number,
+  height: number,
+  depth: number,
+  radius: number,
+) {
+  const geometry = new THREE.ExtrudeGeometry(createRoundedRectShape(width, height, radius), {
+    depth,
+    bevelEnabled: false,
+    curveSegments: 18,
+    steps: 1,
+  });
+
+  geometry.translate(0, 0, -depth / 2);
+  geometry.computeVertexNormals();
+
+  return geometry;
+}
+
+function createLeatherTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 512;
+  canvas.height = 512;
+
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    return null;
+  }
+
+  const gradient = context.createLinearGradient(0, 0, 512, 512);
+  gradient.addColorStop(0, "#6d2b1d");
+  gradient.addColorStop(0.35, "#4f1b12");
+  gradient.addColorStop(0.7, "#34100b");
+  gradient.addColorStop(1, "#240907");
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 512, 512);
+
+  for (let index = 0; index < 5000; index += 1) {
+    const x = Math.random() * 512;
+    const y = Math.random() * 512;
+    const radius = 0.6 + Math.random() * 2.4;
+    const alpha = 0.04 + Math.random() * 0.08;
+
+    context.fillStyle = `rgba(255,235,208,${alpha})`;
+    context.beginPath();
+    context.arc(x, y, radius, 0, Math.PI * 2);
+    context.fill();
+  }
+
+  for (let index = 0; index < 7000; index += 1) {
+    const x = Math.random() * 512;
+    const y = Math.random() * 512;
+    const width = 2 + Math.random() * 6;
+    const height = 1 + Math.random() * 3;
+    const alpha = 0.02 + Math.random() * 0.05;
+
+    context.fillStyle = `rgba(20,8,5,${alpha})`;
+    context.beginPath();
+    context.ellipse(x, y, width, height, Math.random() * Math.PI, 0, Math.PI * 2);
+    context.fill();
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(2.4, 2.4);
+
+  return texture;
+}
+
+function disposeThreeObject(object: THREE.Object3D) {
+  object.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+
+    if (mesh.geometry) {
+      mesh.geometry.dispose();
+    }
+
+    if (!mesh.material) {
+      return;
+    }
+
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+
+    for (const material of materials) {
+      const texturedMaterial = material as THREE.Material & {
+        map?: THREE.Texture | null;
+      };
+
+      if (texturedMaterial.map) {
+        texturedMaterial.map.dispose();
+      }
+
+      material.dispose();
+    }
+  });
+}
+
+function buildSuitcaseScene(mountNode: HTMLDivElement, hostNode: HTMLDivElement): ThreeSceneState {
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(28, 1, 0.1, 100);
+  camera.position.set(0, 0.45, 11.8);
+
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    alpha: true,
+    powerPreference: "high-performance",
+  });
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setClearColor(0x000000, 0);
+  mountNode.appendChild(renderer.domElement);
+
+  const suitcaseGroup = new THREE.Group();
+  suitcaseGroup.rotation.x = -0.08;
+  scene.add(suitcaseGroup);
+
+  const leatherTexture = createLeatherTexture();
+  const leatherMaterial = new THREE.MeshPhysicalMaterial({
+    color: "#4e1a12",
+    map: leatherTexture,
+    roughness: 0.95,
+    metalness: 0.08,
+    clearcoat: 0.18,
+    clearcoatRoughness: 0.82,
+  });
+  const edgeMaterial = new THREE.MeshStandardMaterial({
+    color: "#2a0c08",
+    roughness: 0.82,
+    metalness: 0.16,
+  });
+  const brassMaterial = new THREE.MeshStandardMaterial({
+    color: "#c7a15c",
+    roughness: 0.34,
+    metalness: 0.88,
+  });
+  const liningMaterial = new THREE.MeshStandardMaterial({
+    color: "#17110f",
+    roughness: 1,
+    metalness: 0.04,
+  });
+
+  const caseWidth = 9.6;
+  const caseHeight = 7.8;
+  const caseDepth = 1.08;
+  const caseRadius = 0.38;
+  const lidDepth = 0.46;
+
+  const bodyGeometry = createRoundedCaseGeometry(
+    caseWidth,
+    caseHeight,
+    caseDepth,
+    caseRadius,
+  );
+  const lidGeometry = createRoundedCaseGeometry(
+    caseWidth,
+    caseHeight,
+    lidDepth,
+    caseRadius,
+  );
+  const interiorPanelGeometry = createRoundedCaseGeometry(
+    caseWidth - 0.85,
+    caseHeight - 0.85,
+    0.14,
+    0.28,
+  );
+
+  const bodyMesh = new THREE.Mesh(bodyGeometry, leatherMaterial);
+  bodyMesh.castShadow = true;
+  bodyMesh.receiveShadow = true;
+  bodyMesh.position.z = -0.12;
+  suitcaseGroup.add(bodyMesh);
+
+  const bodyLip = new THREE.Mesh(
+    createRoundedCaseGeometry(caseWidth - 0.35, caseHeight - 0.35, 0.12, 0.32),
+    edgeMaterial,
+  );
+  bodyLip.castShadow = true;
+  bodyLip.position.z = caseDepth / 2 - 0.08;
+  suitcaseGroup.add(bodyLip);
+
+  const interiorPanel = new THREE.Mesh(interiorPanelGeometry, liningMaterial);
+  interiorPanel.receiveShadow = true;
+  interiorPanel.position.z = caseDepth / 2 - 0.03;
+  suitcaseGroup.add(interiorPanel);
+
+  const innerFrame = new THREE.Mesh(
+    createRoundedCaseGeometry(caseWidth - 0.95, caseHeight - 0.95, 0.06, 0.26),
+    new THREE.MeshStandardMaterial({
+      color: "#2b201c",
+      roughness: 0.96,
+      metalness: 0.03,
+    }),
+  );
+  innerFrame.position.z = caseDepth / 2 + 0.03;
+  suitcaseGroup.add(innerFrame);
+
+  const lidPivot = new THREE.Group();
+  lidPivot.position.set(0, -caseHeight / 2 + 0.12, caseDepth / 2 + lidDepth / 2 - 0.05);
+  suitcaseGroup.add(lidPivot);
+
+  const lidMesh = new THREE.Mesh(lidGeometry, leatherMaterial.clone());
+  lidMesh.castShadow = true;
+  lidMesh.receiveShadow = true;
+  lidMesh.position.y = caseHeight / 2 - 0.12;
+  lidPivot.add(lidMesh);
+
+  const lidInnerPanel = new THREE.Mesh(
+    createRoundedCaseGeometry(caseWidth - 0.85, caseHeight - 0.85, 0.08, 0.28),
+    new THREE.MeshStandardMaterial({
+      color: "#211613",
+      roughness: 1,
+      metalness: 0.04,
+    }),
+  );
+  lidInnerPanel.position.set(0, caseHeight / 2 - 0.12, -lidDepth / 2 + 0.07);
+  lidPivot.add(lidInnerPanel);
+
+  const handleGroup = new THREE.Group();
+  handleGroup.position.set(0, caseHeight / 2 - 0.08, lidDepth / 2 + 0.16);
+  lidPivot.add(handleGroup);
+
+  const handleSupportGeometry = new THREE.CylinderGeometry(0.08, 0.08, 0.42, 18);
+  const leftSupport = new THREE.Mesh(handleSupportGeometry, brassMaterial);
+  leftSupport.position.set(-1.45, 0.08, 0);
+  leftSupport.castShadow = true;
+  handleGroup.add(leftSupport);
+
+  const rightSupport = leftSupport.clone();
+  rightSupport.position.x = 1.45;
+  handleGroup.add(rightSupport);
+
+  const handleCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-1.6, 0.12, 0),
+    new THREE.Vector3(-1.2, 0.92, 0.02),
+    new THREE.Vector3(0, 1.3, 0.04),
+    new THREE.Vector3(1.2, 0.92, 0.02),
+    new THREE.Vector3(1.6, 0.12, 0),
+  ]);
+  const handleTube = new THREE.Mesh(
+    new THREE.TubeGeometry(handleCurve, 36, 0.18, 18, false),
+    new THREE.MeshStandardMaterial({
+      color: "#522017",
+      roughness: 0.88,
+      metalness: 0.08,
+    }),
+  );
+  handleTube.castShadow = true;
+  handleGroup.add(handleTube);
+
+  const hingePrototype = new THREE.Mesh(
+    new THREE.BoxGeometry(0.8, 0.28, 0.24),
+    brassMaterial,
+  );
+  hingePrototype.castShadow = true;
+  hingePrototype.receiveShadow = true;
+
+  for (const x of [-2.5, 0, 2.5]) {
+    const hinge = hingePrototype.clone();
+    hinge.position.set(x, -caseHeight / 2 + 0.12, caseDepth / 2 + 0.1);
+    suitcaseGroup.add(hinge);
+  }
+
+  const footGeometry = new THREE.SphereGeometry(0.09, 20, 20);
+  const leftFoot = new THREE.Mesh(footGeometry, brassMaterial);
+  leftFoot.position.set(-caseWidth / 2 + 0.45, -caseHeight / 2 - 0.08, -0.2);
+  suitcaseGroup.add(leftFoot);
+
+  const rightFoot = leftFoot.clone();
+  rightFoot.position.x = caseWidth / 2 - 0.45;
+  suitcaseGroup.add(rightFoot);
+
+  const ambientLight = new THREE.AmbientLight("#f7e4c7", 1.4);
+  scene.add(ambientLight);
+
+  const keyLight = new THREE.DirectionalLight("#ffe7bd", 1.75);
+  keyLight.position.set(-5, 5, 8);
+  keyLight.castShadow = true;
+  keyLight.shadow.mapSize.width = 1024;
+  keyLight.shadow.mapSize.height = 1024;
+  scene.add(keyLight);
+
+  const fillLight = new THREE.DirectionalLight("#b57d5b", 0.8);
+  fillLight.position.set(5, 1.5, 5);
+  scene.add(fillLight);
+
+  const rimLight = new THREE.PointLight("#ffcf8f", 2.3, 26, 2);
+  rimLight.position.set(0, 2.5, 3.5);
+  scene.add(rimLight);
+
+  let width = 0;
+  let height = 0;
+  let frameId = 0;
+
+  const render = () => {
+    const nextWidth = Math.max(hostNode.clientWidth, 1);
+    const nextHeight = Math.max(hostNode.clientHeight, 1);
+
+    if (nextWidth !== width || nextHeight !== height) {
+      width = nextWidth;
+      height = nextHeight;
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+    }
+
+    camera.lookAt(0, 0.15, 0);
+    renderer.render(scene, camera);
+    frameId = window.requestAnimationFrame(render);
+  };
+
+  render();
+
+  return {
+    camera,
+    renderer,
+    suitcaseGroup,
+    lidPivot,
+    dispose: () => {
+      window.cancelAnimationFrame(frameId);
+      disposeThreeObject(scene);
+      renderer.dispose();
+
+      if (leatherTexture) {
+        leatherTexture.dispose();
+      }
+
+      mountNode.replaceChildren();
+    },
+  };
 }
 
 export function JobScraperShell() {
@@ -93,16 +456,14 @@ export function JobScraperShell() {
   const scrollSceneRef = useRef<HTMLDivElement | null>(null);
   const pinStageRef = useRef<HTMLDivElement | null>(null);
   const suitcaseFrameRef = useRef<HTMLDivElement | null>(null);
-  const frontPanelRef = useRef<HTMLDivElement | null>(null);
-  const innerShellRef = useRef<HTMLDivElement | null>(null);
+  const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const contentDeckRef = useRef<HTMLDivElement | null>(null);
-  const handleRef = useRef<HTMLDivElement | null>(null);
-  const hingeRowRef = useRef<HTMLDivElement | null>(null);
   const searchClusterRef = useRef<HTMLDivElement | null>(null);
   const trayRef = useRef<HTMLDivElement | null>(null);
-  const interiorGlowRef = useRef<HTMLDivElement | null>(null);
   const caseShadowRef = useRef<HTMLDivElement | null>(null);
+  const scrollHintRef = useRef<HTMLDivElement | null>(null);
   const forceScrapeRef = useRef(false);
+  const threeSceneRef = useRef<ThreeSceneState | null>(null);
 
   const executeSearch = (nextRole = selectedRole, nextForceScrape = true) => {
     setSelectedRole(nextRole);
@@ -118,7 +479,31 @@ export function JobScraperShell() {
   };
 
   useEffect(() => {
+    if (!canvasHostRef.current || !suitcaseFrameRef.current) {
+      return;
+    }
+
+    const threeScene = buildSuitcaseScene(canvasHostRef.current, suitcaseFrameRef.current);
+    threeSceneRef.current = threeScene;
+
+    return () => {
+      threeSceneRef.current = null;
+      threeScene.dispose();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!threeSceneRef.current) {
+      return;
+    }
+
     const context = gsap.context(() => {
+      const threeScene = threeSceneRef.current;
+
+      if (!threeScene) {
+        return;
+      }
+
       gsap.set(suitcaseFrameRef.current, {
         top: "50%",
         left: "50%",
@@ -126,57 +511,45 @@ export function JobScraperShell() {
         height: `min(90vh, calc(90vw / ${CASE_RATIO}))`,
         xPercent: -50,
         yPercent: -50,
-        borderRadius: 48,
-        scale: 1,
-        transformOrigin: "50% 50%",
-      });
-      gsap.set(frontPanelRef.current, {
-        rotateX: 0,
-        y: 0,
-        z: 0,
-        transformOrigin: "50% 100%",
-        transformPerspective: 3200,
-        transformStyle: "preserve-3d",
-        backfaceVisibility: "hidden",
-      });
-      gsap.set(hingeRowRef.current, {
-        autoAlpha: 1,
-        transformOrigin: "50% 50%",
-        transformPerspective: 2400,
-      });
-      gsap.set(innerShellRef.current, {
-        top: 22,
-        right: 22,
-        bottom: 22,
-        left: 22,
-        borderRadius: 34,
+        borderRadius: 44,
       });
       gsap.set(contentDeckRef.current, {
-        top: 34,
-        right: 34,
-        bottom: 34,
-        left: 34,
-        borderRadius: 30,
+        top: 28,
+        right: 28,
+        bottom: 28,
+        left: 28,
+        borderRadius: 32,
         autoAlpha: 0,
-        scale: 0.96,
+        scale: 0.95,
       });
       gsap.set(searchClusterRef.current, {
         autoAlpha: 0,
-        y: 24,
+        y: 22,
       });
       gsap.set(trayRef.current, {
         autoAlpha: 0,
-        y: 42,
+        y: 34,
       });
-      gsap.set(interiorGlowRef.current, {
-        autoAlpha: 0,
-        scale: 0.84,
-        transformOrigin: "50% 50%",
+      gsap.set(scrollHintRef.current, {
+        autoAlpha: 1,
+        y: 0,
       });
       gsap.set(caseShadowRef.current, {
-        scale: 0.82,
-        autoAlpha: 0.56,
-        transformOrigin: "50% 50%",
+        scale: 0.86,
+        autoAlpha: 0.58,
+      });
+      gsap.set(threeScene.lidPivot.rotation, {
+        x: 0,
+      });
+      gsap.set(threeScene.suitcaseGroup.rotation, {
+        x: -0.08,
+        y: 0,
+        z: 0,
+      });
+      gsap.set(threeScene.camera.position, {
+        x: 0,
+        y: 0.45,
+        z: 11.8,
       });
 
       const timeline = gsap.timeline({
@@ -187,7 +560,7 @@ export function JobScraperShell() {
           trigger: scrollSceneRef.current,
           pin: pinStageRef.current,
           start: "top top",
-          end: "+=220%",
+          end: "+=235%",
           scrub: 1,
           anticipatePin: 1,
         },
@@ -198,57 +571,54 @@ export function JobScraperShell() {
           ".scene-orb",
           {
             yPercent: -10,
-            scale: 1.06,
+            scale: 1.04,
             stagger: 0.08,
-            duration: 0.26,
+            duration: 0.18,
           },
           0,
         )
         .to(
           caseShadowRef.current,
           {
-            scale: 1.04,
-            autoAlpha: 0.9,
-            duration: 0.18,
+            scale: 1.08,
+            autoAlpha: 0.92,
+            duration: 0.2,
           },
           0,
         )
         .to(
-          frontPanelRef.current,
+          scrollHintRef.current,
           {
-            rotateX: 108,
-            y: 92,
-            z: 280,
-            duration: 0.42,
+            autoAlpha: 0,
+            y: -14,
+            duration: 0.12,
           },
-          0.04,
+          0.06,
         )
         .to(
-          hingeRowRef.current,
+          threeScene.lidPivot.rotation,
           {
-            rotateX: -72,
-            y: 16,
-            duration: 0.28,
+            x: -Math.PI / 2,
+            duration: 0.36,
           },
           0.08,
         )
         .to(
-          interiorGlowRef.current,
+          threeScene.suitcaseGroup.rotation,
           {
-            autoAlpha: 1,
-            scale: 1,
-            duration: 0.18,
+            x: -0.02,
+            duration: 0.32,
           },
-          0.16,
+          0.1,
         )
         .to(
-          contentDeckRef.current,
+          threeScene.camera.position,
           {
-            autoAlpha: 1,
-            scale: 1,
-            duration: 0.12,
+            y: 1.1,
+            z: 9.1,
+            duration: 0.28,
           },
-          0.22,
+          0.24,
         )
         .to(
           suitcaseFrameRef.current,
@@ -260,20 +630,17 @@ export function JobScraperShell() {
             xPercent: 0,
             yPercent: 0,
             borderRadius: 0,
-            duration: 0.44,
+            duration: 0.42,
             ease: "power3.inOut",
           },
-          0.36,
+          0.34,
         )
         .to(
-          innerShellRef.current,
+          threeScene.camera.position,
           {
-            top: 0,
-            right: 0,
-            bottom: 0,
-            left: 0,
-            borderRadius: 0,
-            duration: 0.34,
+            y: 1.95,
+            z: 6.55,
+            duration: 0.4,
           },
           0.38,
         )
@@ -285,42 +652,27 @@ export function JobScraperShell() {
             bottom: 0,
             left: 0,
             borderRadius: 0,
-            duration: 0.34,
-          },
-          0.42,
-        )
-        .to(
-          ".case-trim",
-          {
-            autoAlpha: 0,
-            duration: 0.16,
+            duration: 0.32,
           },
           0.48,
         )
         .to(
-          [handleRef.current, hingeRowRef.current, caseShadowRef.current],
+          contentDeckRef.current,
           {
-            autoAlpha: 0,
-            duration: 0.14,
+            autoAlpha: 1,
+            scale: 1,
+            duration: 0.16,
           },
           0.56,
-        )
-        .to(
-          frontPanelRef.current,
-          {
-            autoAlpha: 0,
-            duration: 0.12,
-          },
-          0.6,
         )
         .to(
           searchClusterRef.current,
           {
             autoAlpha: 1,
             y: 0,
-            duration: 0.16,
+            duration: 0.14,
           },
-          0.66,
+          0.64,
         )
         .to(
           trayRef.current,
@@ -329,7 +681,7 @@ export function JobScraperShell() {
             y: 0,
             duration: 0.18,
           },
-          0.72,
+          0.7,
         );
     }, shellRef);
 
@@ -427,14 +779,14 @@ export function JobScraperShell() {
       cards,
       {
         autoAlpha: 0,
-        y: 48,
-        rotateX: -14,
+        y: 42,
+        rotateX: -12,
       },
       {
         autoAlpha: 1,
         y: 0,
         rotateX: 0,
-        duration: 0.56,
+        duration: 0.52,
         stagger: 0.03,
         ease: "power3.out",
       },
@@ -457,7 +809,7 @@ export function JobScraperShell() {
 
       <section
         ref={scrollSceneRef}
-        className="relative h-[240vh]"
+        className="relative h-[255vh]"
       >
         <div
           ref={pinStageRef}
@@ -467,63 +819,44 @@ export function JobScraperShell() {
             <div className="relative h-full [perspective:3200px]">
               <div
                 ref={caseShadowRef}
-                className="pointer-events-none absolute left-1/2 top-[78%] h-32 w-[70vw] max-w-[72rem] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,_rgba(24,13,7,0.58),_transparent_72%)] blur-3xl"
+                className="pointer-events-none absolute left-1/2 top-[82%] h-36 w-[74vw] max-w-[62rem] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,_rgba(22,10,7,0.72),_rgba(22,10,7,0.38)_36%,_transparent_78%)] blur-3xl"
               />
 
               <div
                 ref={suitcaseFrameRef}
-                className="absolute will-change-transform"
+                className="absolute overflow-hidden will-change-transform"
                 style={{
                   top: "50%",
                   left: "50%",
                   width: `min(90vw, calc(90vh * ${CASE_RATIO}))`,
                   height: `min(90vh, calc(90vw / ${CASE_RATIO}))`,
-                  borderRadius: 48,
+                  borderRadius: 44,
                 }}
               >
-                <div className="case-trim absolute inset-0 rounded-[inherit] border border-[rgba(255,238,214,0.44)] bg-[linear-gradient(180deg,#e3b16b,#9a5a31)] shadow-[0_45px_120px_rgba(88,51,19,0.36)]" />
-                <div className="case-trim absolute inset-[12px] rounded-[calc(inherit-8px)] border border-[rgba(119,72,35,0.26)] bg-[linear-gradient(180deg,#f0ce96,#bc703b)]" />
-                <div className="case-trim absolute inset-x-[18px] bottom-[8px] h-[22px] rounded-b-[34px] bg-[linear-gradient(180deg,#8a5029,#5d3317)] opacity-90" />
-                <div className="case-trim absolute bottom-[18px] left-[8px] top-[18px] w-[16px] rounded-l-[30px] bg-[linear-gradient(90deg,#cf8a48,#7b461f)] opacity-70" />
-                <div className="case-trim absolute bottom-[18px] right-[8px] top-[18px] w-[16px] rounded-r-[30px] bg-[linear-gradient(90deg,#7b461f,#cf8a48)] opacity-70" />
-                <div className="case-trim absolute inset-x-[7%] top-[9%] h-[1px] bg-[rgba(255,245,228,0.36)]" />
-                <div className="case-trim absolute inset-x-[7%] bottom-[9%] h-[1px] bg-[rgba(123,79,38,0.28)]" />
-
                 <div
-                  ref={handleRef}
-                  className="absolute left-1/2 top-[-18px] z-40 h-14 w-44 -translate-x-1/2 rounded-[20px_20px_10px_10px] border-[5px] border-[rgba(91,54,19,0.34)] bg-[linear-gradient(180deg,#fae0b6,#d6984a)] shadow-[0_20px_36px_rgba(78,47,17,0.16)]"
+                  ref={canvasHostRef}
+                  className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.1),_transparent_34%),linear-gradient(180deg,rgba(77,36,27,0.06),rgba(16,10,8,0.12))]"
                 />
 
                 <div
-                  ref={innerShellRef}
-                  className="absolute z-10 overflow-hidden bg-[linear-gradient(180deg,#281c18,#120d0c)]"
-                  style={{
-                    top: 22,
-                    right: 22,
-                    bottom: 22,
-                    left: 22,
-                    borderRadius: 34,
-                  }}
+                  ref={scrollHintRef}
+                  className="pointer-events-none absolute bottom-[7%] left-1/2 z-20 flex -translate-x-1/2 flex-col items-center gap-3 rounded-full border border-[rgba(255,239,214,0.16)] bg-[rgba(24,14,12,0.28)] px-5 py-3 text-center text-[#f3dfc7] shadow-[0_18px_40px_rgba(0,0,0,0.18)] backdrop-blur-md"
                 >
-                  <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(245,167,73,0.1),_transparent_40%)]" />
-                  <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(180deg,rgba(255,255,255,0.025)_1px,transparent_1px)] bg-[size:46px_46px]" />
-                  <div className="absolute inset-[18px] rounded-[28px] border border-[rgba(255,232,196,0.08)]" />
+                  <span className="text-xs font-semibold uppercase tracking-[0.34em]">
+                    Scroll To Open The Suitcase
+                  </span>
+                  <span className="h-7 w-px bg-[linear-gradient(180deg,rgba(255,239,214,0.76),transparent)]" />
                 </div>
 
                 <div
-                  ref={interiorGlowRef}
-                  className="pointer-events-none absolute inset-x-[16%] top-[12%] z-10 h-[28%] rounded-full bg-[radial-gradient(circle,_rgba(230,174,88,0.34),_transparent_72%)] blur-3xl"
-                />
-
-                <div
                   ref={contentDeckRef}
-                  className="absolute z-20 flex flex-col overflow-hidden bg-[linear-gradient(180deg,rgba(17,13,12,0.76),rgba(10,8,7,0.98))] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+                  className="absolute z-20 flex flex-col overflow-hidden bg-[linear-gradient(180deg,rgba(18,13,12,0.72),rgba(8,6,6,0.96))] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
                   style={{
-                    top: 34,
-                    right: 34,
-                    bottom: 34,
-                    left: 34,
-                    borderRadius: 30,
+                    top: 28,
+                    right: 28,
+                    bottom: 28,
+                    left: 28,
+                    borderRadius: 32,
                   }}
                 >
                   <div className="flex h-full w-full flex-col">
@@ -537,14 +870,14 @@ export function JobScraperShell() {
                     >
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div className="flex flex-wrap items-center gap-3 text-[#d9c09d]">
-                          <div className="rounded-full border border-[rgba(255,239,214,0.12)] bg-[rgba(255,248,235,0.06)] px-4 py-2 font-mono text-[11px] uppercase tracking-[0.28em]">
+                          <div className="rounded-full border border-[rgba(255,239,214,0.12)] bg-[rgba(255,248,235,0.06)] px-4 py-2 text-[11px] uppercase tracking-[0.28em]">
                             {total.toLocaleString()} indexed
                           </div>
-                          <div className="rounded-full border border-[rgba(255,239,214,0.12)] bg-[rgba(255,248,235,0.06)] px-4 py-2 font-mono text-[11px] uppercase tracking-[0.28em]">
+                          <div className="rounded-full border border-[rgba(255,239,214,0.12)] bg-[rgba(255,248,235,0.06)] px-4 py-2 text-[11px] uppercase tracking-[0.28em]">
                             {formatRelative(lastSeenAt)}
                           </div>
                           {scrapeSummary ? (
-                            <div className="rounded-full border border-[rgba(255,239,214,0.12)] bg-[rgba(255,248,235,0.06)] px-4 py-2 font-mono text-[11px] uppercase tracking-[0.28em]">
+                            <div className="rounded-full border border-[rgba(255,239,214,0.12)] bg-[rgba(255,248,235,0.06)] px-4 py-2 text-[11px] uppercase tracking-[0.28em]">
                               scraped {scrapeSummary.fetched.toLocaleString()} in {formatDuration(scrapeSummary.durationMs)}
                             </div>
                           ) : null}
@@ -556,7 +889,7 @@ export function JobScraperShell() {
                           disabled={isLoading || isScraping}
                           className="rounded-full border border-[rgba(234,175,96,0.46)] bg-[rgba(225,161,76,0.14)] px-5 py-3 text-sm font-semibold text-[#f7d8a8] shadow-[0_16px_36px_rgba(0,0,0,0.22)] transition duration-300 hover:border-[rgba(245,190,112,0.7)] hover:bg-[rgba(225,161,76,0.22)] disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          {isScraping ? "Scraping live sources..." : "Scrape more related roles"}
+                          {isScraping ? "Scraping LinkedIn + Unstop..." : "Scrape LinkedIn + Unstop"}
                         </button>
                       </div>
 
@@ -565,7 +898,7 @@ export function JobScraperShell() {
                         className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(240px,0.75fr)] xl:grid-cols-[minmax(0,1.1fr)_minmax(260px,0.75fr)_auto]"
                       >
                         <label className="group relative block w-full">
-                          <span className="pointer-events-none absolute left-6 top-1/2 -translate-y-1/2 font-mono text-2xl text-[rgba(85,63,39,0.48)] transition-transform duration-300 group-focus-within:scale-110">
+                          <span className="pointer-events-none absolute left-6 top-1/2 -translate-y-1/2 text-2xl text-[rgba(85,63,39,0.48)] transition-transform duration-300 group-focus-within:scale-110">
                             /
                           </span>
                           <input
@@ -580,7 +913,7 @@ export function JobScraperShell() {
                         </label>
 
                         <label className="group relative block w-full">
-                          <span className="pointer-events-none absolute left-6 top-1/2 -translate-y-1/2 font-mono text-sm uppercase tracking-[0.24em] text-[rgba(85,63,39,0.56)]">
+                          <span className="pointer-events-none absolute left-6 top-1/2 -translate-y-1/2 text-sm uppercase tracking-[0.24em] text-[rgba(85,63,39,0.56)]">
                             LOC
                           </span>
                           <input
@@ -697,7 +1030,7 @@ export function JobScraperShell() {
                                   )}
 
                                   <div>
-                                    <p className="font-mono text-[10px] uppercase tracking-[0.26em] text-[var(--muted)]">
+                                    <p className="text-[10px] uppercase tracking-[0.26em] text-[var(--muted)]">
                                       {job.providerLabel}
                                     </p>
                                     <p className="mt-1 text-lg font-semibold leading-tight text-[var(--ink)]">
@@ -748,53 +1081,6 @@ export function JobScraperShell() {
                           No roles match the current search yet. Change the role, keyword, or location and scrape again.
                         </div>
                       )}
-                    </div>
-                  </div>
-                </div>
-
-                <div
-                  ref={hingeRowRef}
-                  className="absolute inset-x-0 bottom-[-14px] z-40 flex items-center justify-center gap-4 sm:gap-6"
-                >
-                  {Array.from({ length: 3 }, (_, index) => (
-                    <div
-                      key={index}
-                      className="h-8 w-14 rounded-[10px] border-[3px] border-[rgba(95,57,22,0.4)] bg-[linear-gradient(180deg,#f2d19c,#bd743d)] shadow-[0_12px_20px_rgba(69,38,12,0.22)]"
-                    />
-                  ))}
-                </div>
-
-                <div
-                  ref={frontPanelRef}
-                  className="absolute inset-[12px] z-30 overflow-hidden rounded-[40px] border border-[rgba(107,67,29,0.18)] bg-[linear-gradient(180deg,#f7e3bf_0%,#e3b067_50%,#c5763e_100%)] shadow-[0_34px_90px_rgba(78,46,16,0.28)]"
-                >
-                  <div className="absolute inset-x-0 bottom-0 h-7 bg-[linear-gradient(180deg,#8e542a,#5a3116)]" />
-                  <div className="absolute bottom-[10px] left-0 top-[10px] w-4 bg-[linear-gradient(90deg,#f7e3bf,#c47b3a)] opacity-80" />
-                  <div className="absolute bottom-[10px] right-0 top-[10px] w-4 bg-[linear-gradient(90deg,#c47b3a,#8a5029)] opacity-80" />
-                  <div className="absolute inset-0 bg-[linear-gradient(120deg,rgba(255,255,255,0.44),transparent_30%,transparent_72%,rgba(104,66,28,0.18))]" />
-                  <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(122,82,38,0.08)_1px,transparent_1px),linear-gradient(180deg,rgba(122,82,38,0.08)_1px,transparent_1px)] bg-[size:42px_42px] opacity-50" />
-                  <div className="absolute inset-[7%] rounded-[30px] border border-[rgba(108,68,29,0.18)]" />
-                  <div className="absolute left-[8%] right-[8%] top-[14%] h-[1px] bg-[rgba(255,247,230,0.3)]" />
-                  <div className="absolute left-[8%] right-[8%] bottom-[14%] h-[1px] bg-[rgba(104,66,28,0.18)]" />
-                  <div className="relative flex h-full flex-col items-center justify-center p-8 text-[#4b2c12]">
-                    <div className="relative mb-10 flex h-36 w-40 items-center justify-center rounded-[32px] border-[4px] border-[#5d3915] bg-[rgba(255,250,244,0.2)] shadow-[inset_0_1px_0_rgba(255,255,255,0.5)]">
-                      <div className="absolute left-1/2 top-[-26px] h-12 w-20 -translate-x-1/2 rounded-t-[18px] border-[4px] border-b-0 border-[#5d3915]" />
-                      <div className="h-10 w-16 rounded-xl border-[4px] border-[#5d3915]" />
-                      <div className="absolute inset-x-8 top-1/2 h-[4px] -translate-y-1/2 rounded-full bg-[#5d3915]" />
-                    </div>
-
-                    <div className="flex gap-5 opacity-70">
-                      <div className="h-2.5 w-24 rounded-full bg-[rgba(93,57,21,0.24)]" />
-                      <div className="h-2.5 w-32 rounded-full bg-[rgba(93,57,21,0.14)]" />
-                    </div>
-                    <div className="mt-4 flex gap-4 opacity-50">
-                      <div className="h-2.5 w-28 rounded-full bg-[rgba(93,57,21,0.14)]" />
-                      <div className="h-2.5 w-20 rounded-full bg-[rgba(93,57,21,0.14)]" />
-                      <div className="h-2.5 w-24 rounded-full bg-[rgba(93,57,21,0.14)]" />
-                    </div>
-
-                    <div className="absolute bottom-[14%] font-mono text-[11px] uppercase tracking-[0.42em] text-[#74481f]">
-                      scroll to open
                     </div>
                   </div>
                 </div>

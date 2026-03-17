@@ -11,6 +11,8 @@ const eslintConfig = defineConfig([
     ".next/**",
     "out/**",
     "build/**",
+    ".vectra/**",
+    ".mongodb-data/**",
     "next-env.d.ts",
   ]),
 ]);

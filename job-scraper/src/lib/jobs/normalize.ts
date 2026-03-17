@@ -4,12 +4,17 @@ import { compactWhitespace, toKebabCase } from "@/lib/jobs/text";
 const AGGREGATOR_HOSTS = new Set([
   "arbeitnow.com",
   "www.arbeitnow.com",
+  "linkedin.com",
+  "www.linkedin.com",
+  "in.linkedin.com",
   "remoteok.com",
   "remoteok.io",
   "www.remoteok.com",
   "www.themuse.com",
   "themuse.com",
   "remotive.com",
+  "unstop.com",
+  "www.unstop.com",
 ]);
 
 const ATS_HOSTS = new Set([
