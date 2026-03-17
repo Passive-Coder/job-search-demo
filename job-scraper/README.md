@@ -82,3 +82,4 @@ npm run build
 
 - The app expects Chroma Cloud credentials in the environment before any scrape or search requests can hit the vector store.
 - No local `.vectra` files are used anymore; embeddings and metadata are stored in ChromaDB.
+- yeah
