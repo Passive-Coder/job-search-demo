@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f6efe2;
+  --foreground: #201810;
+  --ink: #221910;
+  --muted: #736354;
+  --surface: #fff8ee;
+  --accent: #c98a3a;
+  --accent-deep: #8b5e22;
+  --line: rgba(113, 90, 61, 0.18);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-open-sans);
+  --font-mono: var(--font-open-sans);
+  --font-display: var(--font-open-sans);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  background-image:
+    radial-gradient(circle at top, rgba(255, 248, 230, 0.88), transparent 28%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.62), rgba(244, 229, 204, 0.5)),
+    linear-gradient(180deg, #f6efe2 0%, #f3ead8 52%, #efe5d2 100%);
+  font-family: var(--font-open-sans), Helvetica, Roboto, sans-serif;
+}
+
+a,
+button,
+input {
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  background: rgba(201, 138, 58, 0.22);
+  color: var(--ink);
+}

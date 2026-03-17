@@ -1,0 +1,38 @@
+{
+  "name": "job-scraper",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n web,worker -c blue,magenta \"next dev --webpack\" \"npm:worker:dev\"",
+    "build": "next build --webpack",
+    "start": "concurrently -k -n web,worker -c blue,magenta \"next start\" \"npm:worker:start\"",
+    "worker:dev": "tsx watch src/worker/scrape-worker.ts",
+    "worker:start": "tsx src/worker/scrape-worker.ts",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "concurrently": "^9.2.1",
+    "dotenv": "^17.3.1",
+    "gsap": "^3.14.2",
+    "he": "^1.2.0",
+    "mongoose": "^9.3.0",
+    "next": "16.1.7",
+    "p-limit": "^7.3.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "vectra": "^0.12.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/he": "^1.2.3",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.1.7",
+    "tailwindcss": "^4",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}
